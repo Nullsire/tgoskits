@@ -8,9 +8,10 @@ use ax_task::current;
 use linux_raw_sys::general::*;
 
 use crate::{
-    file::{FileLike, get_file_like, memfd::Memfd},
+    file::get_file_like,
     mm::{Backend, BackendOps, SharedPages},
     pseudofs::{Device, DeviceMmap},
+    syscall::fs::{memfd_check_write_seal, memfd_check_write_seal_for_shared_file_backend},
     task::AsThread,
 };
 
@@ -161,38 +162,47 @@ pub fn sys_mmap(
     let file = if anonymous {
         None
     } else {
-        // Honor F_SEAL_WRITE on `MAP_SHARED|PROT_WRITE` at map-creation
-        // time — Linux rejects this combination on a sealed memfd with
-        // EPERM. Post-mmap revoke (downgrading already-installed VMAs
-        // when F_SEAL_WRITE is later applied) is not yet implemented.
-        if (map_type == MmapFlags::SHARED || map_type == MmapFlags::SHARED_VALIDATE)
-            && permission_flags.contains(MmapProt::WRITE)
-            && let Ok(memfd) = Memfd::from_fd(fd)
-            && memfd.get_seals() & crate::file::memfd::F_SEAL_WRITE != 0
-        {
-            return Err(AxError::OperationNotPermitted);
-        }
         Some(get_file_like(fd)?)
     };
     let mut device_mmap_top = file.as_ref().map(|fl| fl.device_mmap(offset as u64));
 
-    // File-backed `MAP_FIXED`: validate fd mode before any destructive unmap
-    // (Linux `do_mmap` ordering; avoids tearing down the old mapping on `EACCES`).
-    // Covers both regular files and PRIVATE mappings that bypass device_mmap in the
-    // backend match (device_mmap may return Physical/Cache while PRIVATE still uses
-    // file_mmap). `file_mmap()` here is intentionally idempotent with the main path.
-    if map_flags.intersects(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE)
-        && let Some(ref fl) = file
-    {
-        let (_backend, flags) = fl.file_mmap()?;
-        if !flags.contains(FileFlags::READ) {
-            return Err(AxError::PermissionDenied);
-        }
-        if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE)
-            && permission_flags.contains(MmapProt::WRITE)
-            && !flags.contains(FileFlags::WRITE)
-        {
-            return Err(AxError::PermissionDenied);
+    // Validate file_mmap permissions and memfd seals before any destructive
+    // MAP_FIXED unmap (Linux `do_mmap` ordering; avoids tearing down the old
+    // mapping on `EACCES` / `EPERM`). MAP_PRIVATE always uses file_mmap below,
+    // even if device_mmap reports a direct mapping.
+    if let Some(ref fl) = file {
+        let needs_file_mmap_checks = match map_type {
+            MmapFlags::PRIVATE => true,
+            MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE => {
+                // Ok(None) and Err(_) both mean "fall back to file_mmap"
+                // (memfd, regular files). Direct device mappings do not.
+                match device_mmap_top
+                    .as_ref()
+                    .expect("file-backed mmap has cached device_mmap")
+                {
+                    Ok(DeviceMmap::Physical(_)) | Ok(DeviceMmap::Cache(_)) => false,
+                    #[cfg(feature = "kcov")]
+                    Ok(DeviceMmap::SharedPages(_)) | Ok(DeviceMmap::NotConfigured) => false,
+                    Ok(DeviceMmap::None) | Err(_) => true,
+                }
+            }
+            _ => false,
+        };
+        if needs_file_mmap_checks {
+            let (_backend, flags) = fl.file_mmap()?;
+            if !flags.contains(FileFlags::READ) {
+                return Err(AxError::PermissionDenied);
+            }
+            if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE)
+                && permission_flags.contains(MmapProt::WRITE)
+            {
+                if !flags.contains(FileFlags::WRITE) {
+                    return Err(AxError::PermissionDenied);
+                }
+                // Linux: F_SEAL_WRITE forbids shared writable mappings, but still allows
+                // MAP_PRIVATE|PROT_WRITE because it does not modify the underlying file.
+                memfd_check_write_seal(fl)?;
+            }
         }
     }
 
@@ -270,6 +280,7 @@ pub fn sys_mmap(
     }
 
     let mut mapping_flags: MappingFlags = permission_flags.into();
+
     let backend = match map_type {
         MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE => {
             if let Some(ref file) = file {
@@ -438,6 +449,13 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> AxResult<isize> {
     // man 2 mprotect: addresses without a mapping → ENOMEM.
     if aspace.find_area(start_addr).is_none() {
         return Err(AxError::NoMemory);
+    }
+    if permission_flags.contains(MmapProt::WRITE) {
+        for (_frag_start, _frag_size, _old_flags, backend) in
+            aspace.areas_in_range(start_addr, length)
+        {
+            memfd_check_write_seal_for_shared_file_backend(&backend)?;
+        }
     }
     aspace.protect(start_addr, length, permission_flags.into())?;
 

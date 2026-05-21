@@ -6,7 +6,7 @@ use alloc::{
 use core::{
     num::NonZeroUsize,
     ops::Range,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
     task::Context,
 };
 
@@ -416,6 +416,83 @@ impl CachedFileShared {
             evict_listeners: Mutex::new(LinkedList::default()),
         }
     }
+
+    fn try_evict_clean_pages(&self, max: usize) -> usize {
+        let Some(mut cache) = self.page_cache.try_lock() else {
+            return 0;
+        };
+        let mut to_evict = [0u32; 256];
+        let limit = max.min(256);
+        let mut cnt = 0;
+        for (&pn, page) in cache.iter() {
+            if !page.dirty && cnt < limit {
+                to_evict[cnt] = pn;
+                cnt += 1;
+            }
+        }
+        for &pn in to_evict[..cnt].iter() {
+            if let Some(page) = cache.pop(&pn) {
+                for listener in self.evict_listeners.lock().iter() {
+                    (listener.listener)(pn, &page);
+                }
+            }
+        }
+        cnt
+    }
+}
+
+struct ReclaimGuard;
+
+impl Drop for ReclaimGuard {
+    fn drop(&mut self) {
+        RECLAIM_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
+static GLOBAL_CACHED_FILES: spin::RwLock<Vec<Weak<CachedFileShared>>> =
+    spin::RwLock::new(Vec::new());
+
+static RECLAIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+pub fn page_cache_reclaim(num_pages: usize) -> usize {
+    if RECLAIM_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return 0;
+    }
+    let _guard = ReclaimGuard;
+
+    let mut reclaimed = 0;
+    let target = num_pages.max(16) * 2;
+    let mut file_count = 0;
+
+    if let Some(guard) = GLOBAL_CACHED_FILES.try_read() {
+        for weak in guard.iter() {
+            if let Some(file) = weak.upgrade() {
+                let freed = file.try_evict_clean_pages(target - reclaimed);
+                reclaimed += freed;
+                file_count += 1;
+                if reclaimed >= target {
+                    break;
+                }
+            }
+        }
+    } else {
+        return 0;
+    }
+
+    if reclaimed > 0 {
+        debug!(
+            "page_cache_reclaim: evicted {} clean pages across {} files",
+            reclaimed, file_count
+        );
+    }
+
+    reclaimed
+}
+
+fn register_cached_file(file: &Arc<CachedFileShared>) {
+    let mut guard = GLOBAL_CACHED_FILES.write();
+    guard.retain(|w| w.upgrade().is_some());
+    guard.push(Arc::downgrade(file));
 }
 
 /// A file handle with an LRU page cache for buffered I/O.
@@ -459,21 +536,28 @@ impl CachedFile {
         let in_memory = location.filesystem().name() == "tmpfs";
 
         let mut guard = location.user_data();
-        let shared = if let Some(shared) = guard.get::<FileUserData>().and_then(|it| it.get()) {
-            shared
-        } else {
-            let (shared, user_data) = if in_memory {
-                let shared = Arc::new(CachedFileShared::new_unbounded());
-                (shared.clone(), FileUserData::Strong(shared))
+        let (shared, is_new) =
+            if let Some(shared) = guard.get::<FileUserData>().and_then(|it| it.get()) {
+                (shared, false)
             } else {
-                let shared = Arc::new(CachedFileShared::new());
-                let user_data = FileUserData::Weak(Arc::downgrade(&shared));
-                (shared, user_data)
+                let (shared, user_data) = if in_memory {
+                    let shared = Arc::new(CachedFileShared::new_unbounded());
+                    (shared.clone(), FileUserData::Strong(shared))
+                } else {
+                    let shared = Arc::new(CachedFileShared::new());
+                    let user_data = FileUserData::Weak(Arc::downgrade(&shared));
+                    (shared, user_data)
+                };
+                guard.insert(user_data);
+                (shared, true)
             };
-            guard.insert(user_data);
-            shared
-        };
         drop(guard);
+
+        // In-memory files (tmpfs) have no backing store, so evicting clean
+        // pages would lose data. Only register disk-backed files for reclaim.
+        if is_new && !in_memory {
+            register_cached_file(&shared);
+        }
 
         Self {
             inner: location,

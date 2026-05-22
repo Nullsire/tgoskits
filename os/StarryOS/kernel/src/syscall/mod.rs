@@ -696,10 +696,11 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         | Sysno::perf_event_open
         | Sysno::io_uring_setup
         | Sysno::bpf
-        | Sysno::fsopen
-        | Sysno::fspick
-        | Sysno::open_tree
         | Sysno::memfd_secret => sys_dummy_fd(sysno),
+
+        // Return ENOSYS for new mount API so mount(8) falls back to
+        // the traditional mount(2) syscall.
+        Sysno::fsopen | Sysno::fspick | Sysno::open_tree => Err(AxError::Unsupported),
 
         Sysno::fanotify_init | Sysno::inotify_init1 => Err(AxError::Unsupported),
 

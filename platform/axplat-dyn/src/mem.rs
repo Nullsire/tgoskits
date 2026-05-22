@@ -15,7 +15,7 @@ impl MemIf for MemIfImpl {
         FREE_LIST.call_once(|| {
             let mut list = Vec::new();
             for r in somehal::mem::memory_map() {
-                if matches!(r.memory_type, MemoryType::Free) {
+                if r.memory_type == MemoryType::Free {
                     list.push((r.physical_start, r.size_in_bytes)).unwrap();
                 }
             }

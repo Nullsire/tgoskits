@@ -364,6 +364,12 @@ pub fn handle_syscall(uctx: &mut UserContext) {
             uctx.arg2() as _,
             uctx.arg3().into(),
         ),
+        Sysno::epoll_wait => sys_epoll_wait(
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
         Sysno::epoll_pwait => sys_epoll_pwait(
             uctx.arg0() as _,
             uctx.arg1().into(),
@@ -804,11 +810,30 @@ pub fn handle_syscall(uctx: &mut UserContext) {
 
         // dummy fds
         Sysno::userfaultfd
-        | Sysno::io_uring_setup
-        | Sysno::fsopen
-        | Sysno::fspick
-        | Sysno::open_tree
         | Sysno::memfd_secret => sys_dummy_fd(sysno),
+
+        // New mount API — return ENOSYS so mount(8) falls back to
+        // the traditional mount(2) syscall (which is implemented).
+        Sysno::fsopen | Sysno::fspick | Sysno::open_tree => {
+            warn!("new mount API not supported (sysno={sysno}), returning ENOSYS for fallback");
+            Err(AxError::Unsupported)
+        }
+
+        // io_uring: fake enough support so tokio 1.x creates its I/O
+        // driver without panicking, then falls back to blocking I/O.
+        // io_uring_setup returns a dummy fd (tokio thinks io_uring is
+        // available), io_uring_enter/register return 0 (no events /
+        // success).  Without this, tokio calls io_uring_enter on the
+        // dummy fd, gets ENOSYS, and panics — corrupting cargo state.
+        Sysno::io_uring_setup => {
+            warn!("io_uring_setup: returning dummy fd for compatibility");
+            sys_dummy_fd(sysno)
+        }
+        Sysno::io_uring_enter | Sysno::io_uring_register => {
+            // Return 0 = "0 completions" / "successful registration"
+            // so tokio's io_uring driver keeps polling without errors.
+            Ok(0)
+        }
 
         #[cfg(feature = "ebpf")]
         Sysno::bpf => crate::ebpf::sys_bpf(uctx.arg0() as _, uctx.arg1(), uctx.arg2() as _),
